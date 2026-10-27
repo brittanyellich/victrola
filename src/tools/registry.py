@@ -165,7 +165,9 @@ class ToolRegistry:
             # a legitimate object-typed first parameter, only unwrap when the
             # first param is NOT object-typed — a dict value for a scalar param
             # is clearly an envelope, not the intended value. Require at least
-            # one key in the nested object to match a declared param so we
+            # one key in the nested object to match a declared param, except
+            # an empty options object in the first scalar slot means no args.
+            # Otherwise we
             # don't unwrap a dict that happens to be a legitimate scalar value
             # (e.g. a JSON object stored as a string and parsed). Extra keys
             # the model invented are silently dropped so the downstream tool
@@ -176,7 +178,10 @@ class ToolRegistry:
                 isinstance(val, dict)
                 and param_names
                 and not first_is_object
-                and set(val.keys()) & param_names
+                and (
+                    set(val.keys()) & param_names
+                    or (not val and outer_key == first_param.name)
+                )
             ):
                 params = {k: v for k, v in val.items() if k in param_names}
 

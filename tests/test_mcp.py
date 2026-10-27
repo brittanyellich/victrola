@@ -2569,3 +2569,15 @@ async def test_spawn_detached_disconnect_retains_strong_reference(tmp_path):
     assert manager._background_tasks == set()
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_empty_object_discovers_optional_scalar_defaults():
+    registry = ToolRegistry()
+    async def handler(ctx, space=None):
+        return space
+    registry.register(Tool(name="workspace.task_list", description="Discover", parameters=[
+        ToolParameter(name="space", type="string", description="Optional scope", required=False)
+    ], handler=handler))
+    assert await registry.execute(None, "workspace.task_list", {"space": {}}) is None
+    assert await registry.execute(None, "workspace.task_list", {"space": "approved"}) == "approved"
