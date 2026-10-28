@@ -33,6 +33,7 @@ export function MessageBubble({ role, content }: { role: string; content: string
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
+                a: (props) => <a {...props} className="text-primary underline underline-offset-2 hover:opacity-80 focus-visible:outline focus-visible:outline-2" target="_blank" rel="noopener noreferrer" />,
                 pre: (props) => <pre {...props} className="overflow-x-auto" />,
                 code: (props) => <code {...props} className="break-words" />,
               }}

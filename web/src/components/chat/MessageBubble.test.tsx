@@ -41,5 +41,12 @@ describe("MessageBubble", () => {
     );
     const link = screen.getByRole("link", { name: "Click here" });
     expect(link).toHaveAttribute("href", "https://example.com");
+    expect(link).toHaveClass("underline", "text-primary");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
   });
+});
+
+it("autolinks plain URLs in agent replies", () => {
+  render(<MessageBubble role="assistant" content="See https://example.com/path" />);
+  expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/path");
 });

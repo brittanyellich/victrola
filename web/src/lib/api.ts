@@ -74,6 +74,11 @@ export const api = {
       `${API_BASE}/sessions/${enc(id)}/messages?limit=${limit}${cursor ? `&cursor=${enc(cursor)}` : ""}`,
     ),
 
+  interruptChat: (id: string) =>
+    fetchJSON<{ interrupted: boolean }>(`${API_BASE}/sessions/${enc(id)}/interrupt`, {
+      method: "POST",
+    }),
+
   // -- chat (SSE via fetch + ReadableStream) --
 
   chat: (

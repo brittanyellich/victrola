@@ -31,6 +31,26 @@ router = APIRouter()
 _in_flight: set[str] = set()
 # Guard set mutation itself so check+add is atomic across concurrent requests.
 _locks_guard = asyncio.Lock()
+_chat_tasks: dict[str, asyncio.Task] = {}
+_released: dict[str, asyncio.Event] = {}
+_interrupt_requested: set[str] = set()
+
+
+@router.post("/sessions/{session_id}/interrupt")
+async def interrupt_chat(session_id: str) -> dict[str, bool]:
+    async with _locks_guard:
+        task = _chat_tasks.get(session_id)
+        released = _released.get(session_id)
+        if released is None:
+            return {"interrupted": False}
+        # A stream may still be loading history before it creates the task.
+        if session_id not in _interrupt_requested:
+            _interrupt_requested.add(session_id)
+            if task is not None and not task.done():
+                task.cancel()
+    if released is not None:
+        await released.wait()
+    return {"interrupted": True}
 
 
 def _sse(event: str, data: dict[str, Any] | None = None) -> str:
@@ -74,6 +94,7 @@ async def chat(
                 yield _sse("error", {"message": "A chat is already in progress for this session"})
                 return
             _in_flight.add(session_id)
+            _released[session_id] = asyncio.Event()
         try:
             # 1. load full conversation history first — agent.chat() will
             # append the new user turn to this list in place
@@ -135,6 +156,10 @@ async def chat(
                 )
             )
 
+            _chat_tasks[session_id] = chat_task
+            if session_id in _interrupt_requested:
+                chat_task.cancel()
+
             try:
                 # 6. relay events as they arrive
                 while True:
@@ -159,6 +184,14 @@ async def chat(
                 # 7. get the result (response text or exception)
                 try:
                     response = await chat_task
+                except asyncio.CancelledError:
+                    # Explicit interruption cancels the agent, not this stream.
+                    # A disconnect cancels the stream itself and must propagate.
+                    if asyncio.current_task().cancelling():
+                        raise
+                    yield _sse("interrupted", {})
+                    yield _sse("done", {})
+                    return
                 except Exception as e:
                     logger.exception("Agent chat failed")
                     yield _sse("error", {"message": str(e)})
@@ -190,7 +223,10 @@ async def chat(
                         pass
         finally:
             async with _locks_guard:
+                _interrupt_requested.discard(session_id)
+                _chat_tasks.pop(session_id, None)
                 _in_flight.discard(session_id)
+                _released.pop(session_id).set()
 
     return StreamingResponse(
         event_stream(),

@@ -680,3 +680,79 @@ class TestMemory:
         assert resp.status_code == 200
         entries = resp.json()["entries"]
         assert all(e["type"] == "factual" for e in entries)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_waits_for_agent_cleanup_and_releases_session():
+    from src.web.routers.chat import chat, interrupt_chat, _in_flight
+    from src.web.schemas import ChatRequest
+
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def slow_chat(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cleaned_up.set()
+
+    agent = MagicMock()
+    agent.chat = slow_chat
+    executor = MagicMock()
+    executor.store.chat.get_session = AsyncMock(return_value={"id": "interrupt-test"})
+    manager = MagicMock()
+    manager.load_session_with_ids = AsyncMock(return_value=([], []))
+    manager.save_message = AsyncMock()
+    response = await chat("interrupt-test", ChatRequest(message="hello"), agent, executor, manager)
+
+    async def consume():
+        return [event async for event in response.body_iterator]
+
+    stream = asyncio.create_task(consume())
+    await started.wait()
+    result = await asyncio.wait_for(interrupt_chat("interrupt-test"), 2)
+    assert result == {"interrupted": True}
+    assert cleaned_up.is_set()
+    assert "interrupt-test" not in _in_flight
+    events = "".join(await stream)
+    assert "event: interrupted" in events
+    assert "event: done" in events
+    assert await interrupt_chat("interrupt-test") == {"interrupted": False}
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_history_load_prevents_agent_start():
+    from src.web.routers.chat import chat, interrupt_chat, _interrupt_requested
+    from src.web.schemas import ChatRequest
+
+    loading = asyncio.Event()
+    continue_load = asyncio.Event()
+
+    async def load(*args, **kwargs):
+        loading.set()
+        await continue_load.wait()
+        return [], []
+
+    agent = MagicMock()
+    agent.chat = AsyncMock(return_value="should not run")
+    executor = MagicMock()
+    executor.store.chat.get_session = AsyncMock(return_value={})
+    manager = MagicMock()
+    manager.load_session_with_ids = load
+    manager.save_message = AsyncMock()
+    response = await chat("loading-test", ChatRequest(message="hello"), agent, executor, manager)
+
+    async def consume():
+        return [event async for event in response.body_iterator]
+
+    stream = asyncio.create_task(consume())
+    await loading.wait()
+    interrupt = asyncio.create_task(interrupt_chat("loading-test"))
+    await asyncio.sleep(0)
+    assert "loading-test" in _interrupt_requested
+    continue_load.set()
+    assert await asyncio.wait_for(interrupt, 2) == {"interrupted": True}
+    assert "event: interrupted" in "".join(await stream)
+    agent.chat.assert_not_awaited()

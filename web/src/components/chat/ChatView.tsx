@@ -40,6 +40,10 @@ function parseMessage(raw: Message): { role: string; content: string } {
 
 export function ChatView() {
   const { id } = useParams<{ id: string }>();
+  return <SessionChat key={id} id={id} />;
+}
+
+function SessionChat({ id }: { id: string | undefined }) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
@@ -52,6 +56,29 @@ export function ChatView() {
     output: 0,
     calls: 0,
   });
+  const [busy, setBusy] = useState(false);
+  const storageKey = `chat-queue:${id}`;
+  const [queued, setQueued] = useState<string[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(sessionStorage.getItem(storageKey) || "[]");
+      return Array.isArray(saved) ? saved.filter((value): value is string => typeof value === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const queueRef = useRef<string[]>(queued);
+  useEffect(() => {
+    try {
+      if (queued.length) sessionStorage.setItem(storageKey, JSON.stringify(queued));
+      else sessionStorage.removeItem(storageKey);
+    } catch {
+      // Storage can be unavailable; the in-memory queue still works.
+    }
+  }, [queued, storageKey]);
+  const runningRef = useRef(false);
+  const interruptingRef = useRef(false);
+  const [interrupting, setInterrupting] = useState(false);
+  const mountedRef = useRef(true);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -89,10 +116,17 @@ export function ChatView() {
     scrollToBottom();
   }, [items, scrollToBottom]);
 
-  const handleSend = async () => {
-    if (!id || !input.trim()) return;
-    const userText = input.trim();
-    setInput("");
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      queueRef.current = [];
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const sendMessage = async (userText: string) => {
+    if (!id) return;
     setThinking(true);
 
     // add user message to UI immediately
@@ -110,6 +144,7 @@ export function ChatView() {
         userText,
         undefined,
         (event, data) => {
+          if (!mountedRef.current) return;
           switch (event) {
             case "llm_start":
               setThinking(true);
@@ -187,6 +222,12 @@ export function ChatView() {
               ]);
               break;
             }
+            case "interrupted":
+              setItems((prev) => [...prev, {
+                type: "message", key: crypto.randomUUID(), role: "system",
+                content: "Agent interrupted. Sending new context…",
+              }]);
+              break;
             case "done":
               break;
           }
@@ -207,6 +248,60 @@ export function ChatView() {
     }
   };
 
+  const drainQueue = async () => {
+    if (runningRef.current || interruptingRef.current) return;
+    runningRef.current = true;
+    setBusy(true);
+    try {
+      while (mountedRef.current && queueRef.current.length && !interruptingRef.current) {
+        const next = queueRef.current.shift()!;
+        setQueued([...queueRef.current]);
+        await sendMessage(next);
+      }
+    } finally {
+      runningRef.current = false;
+      if (mountedRef.current) {
+        setBusy(false);
+        if (queueRef.current.length && !interruptingRef.current) void drainQueue();
+      }
+    }
+  };
+
+  const handleSend = () => {
+    if (!id || !input.trim() || interruptingRef.current) return;
+    queueRef.current.push(input.trim());
+    setQueued([...queueRef.current]);
+    setInput("");
+    void drainQueue();
+  };
+
+  const handleInterrupt = async () => {
+    if (!id || !input.trim() || interruptingRef.current) return;
+    const context = input.trim();
+    interruptingRef.current = true;
+    setInterrupting(true);
+    try {
+      await api.interruptChat(id);
+      // The server acknowledges only after the old stream releases the session.
+      // Wait for its client-side completion before draining the new context.
+      if (!mountedRef.current) return;
+      queueRef.current.unshift(context);
+      setQueued([...queueRef.current]);
+      setInput("");
+    } catch (error) {
+      if (mountedRef.current) setItems((prev) => [...prev, {
+        type: "message", key: crypto.randomUUID(), role: "system",
+        content: `Could not interrupt agent: ${error instanceof Error ? error.message : String(error)}`,
+      }]);
+    } finally {
+      interruptingRef.current = false;
+      if (mountedRef.current) {
+        setInterrupting(false);
+        void drainQueue();
+      }
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -214,7 +309,7 @@ export function ChatView() {
     }
   };
 
-  const isResponding = thinking || toolName !== null;
+  const isResponding = busy;
 
   return (
     <div className="flex h-full flex-col">
@@ -262,6 +357,20 @@ export function ChatView() {
         calls={tokenStats.calls}
       />
 
+      {queued.length > 0 && (
+        <div className="border-t border-border px-4 py-2 text-sm" aria-live="polite">
+          <p className="text-muted-foreground">Queued for after the current reply:</p>
+          {!busy && !interrupting && (
+            <Button variant="outline" onClick={() => void drainQueue()} disabled={loading}>
+              Resume queued messages
+            </Button>
+          )}
+          <ol className="list-decimal pl-5">
+            {queued.map((text, index) => <li key={index} className="break-words">{text}</li>)}
+          </ol>
+        </div>
+      )}
+
       {/* Input */}
       <div className="flex items-center gap-2 border-t border-border px-4 py-3">
         <Input
@@ -269,11 +378,16 @@ export function ChatView() {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Type a message…"
-          disabled={isResponding}
+          disabled={loading || interrupting}
         />
-        <Button onClick={handleSend} disabled={isResponding || !input.trim()}>
-          Send
+        <Button onClick={handleSend} disabled={loading || interrupting || !input.trim()}>
+          {isResponding ? "Queue message" : "Send"}
         </Button>
+        {isResponding && (
+          <Button variant="outline" onClick={handleInterrupt} disabled={interrupting || !input.trim()}>
+            {interrupting ? "Interrupting…" : "Interrupt and send"}
+          </Button>
+        )}
       </div>
     </div>
   );

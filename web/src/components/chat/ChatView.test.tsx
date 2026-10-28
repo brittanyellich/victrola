@@ -8,7 +8,7 @@ const { mockApi, ApiError } = vi.hoisted(() => ({
   mockApi: {
     getStatus: vi.fn(), listSessions: vi.fn(), createSession: vi.fn(),
     getSession: vi.fn(), deleteSession: vi.fn(), listMessages: vi.fn(),
-    chat: vi.fn(), listTools: vi.fn(), getTool: vi.fn(), approveTool: vi.fn(),
+    interruptChat: vi.fn(), chat: vi.fn(), listTools: vi.fn(), getTool: vi.fn(), approveTool: vi.fn(),
     revokeTool: vi.fn(), deleteTool: vi.fn(), listSecrets: vi.fn(),
     setSecret: vi.fn(), deleteSecret: vi.fn(), listSchedules: vi.fn(),
     createSchedule: vi.fn(), enableSchedule: vi.fn(), disableSchedule: vi.fn(),
@@ -38,6 +38,7 @@ function renderChatView(sessionId: string = "abc123") {
 
 describe("ChatView", () => {
   beforeEach(() => {
+    sessionStorage.clear();
     vi.clearAllMocks();
     api.listMessages.mockResolvedValue(mockMessageList);
     api.chat.mockResolvedValue(undefined);
@@ -99,7 +100,7 @@ describe("ChatView", () => {
     expect(bubbles).toHaveLength(2);
   });
 
-  it("disables input and shows thinking state while responding", async () => {
+  it("keeps input enabled and shows thinking state while responding", async () => {
     api.chat.mockReturnValue(new Promise(() => {}));
     renderChatView();
     await waitFor(() => expect(screen.getByPlaceholderText("Type a message…")).toBeInTheDocument());
@@ -107,7 +108,7 @@ describe("ChatView", () => {
     fireEvent.change(input, { target: { value: "test message" } });
     fireEvent.click(screen.getByText("Send"));
     await waitFor(() => expect(screen.getByText("Thinking…")).toBeInTheDocument());
-    expect(input).toBeDisabled();
+    expect(input).toBeEnabled();
   });
 
   it("shows user message immediately after sending", async () => {
@@ -210,4 +211,90 @@ describe("ChatView", () => {
     fireEvent.keyDown(screen.getByPlaceholderText("Type a message…"), { key: "Enter", shiftKey: true });
     expect(api.chat).not.toHaveBeenCalled();
   });
+});
+
+
+it("queues follow-ups through LLM transitions and sends them in order", async () => {
+  sessionStorage.clear();
+  vi.clearAllMocks();
+  api.listMessages.mockResolvedValue(mockMessageList);
+  const finishes: (() => void)[] = [];
+  let event!: (e: string, d: Record<string, unknown>) => void;
+  api.chat.mockImplementation((_s, _m, _i, cb) => {
+    event = cb;
+    return new Promise<void>(resolve => finishes.push(resolve));
+  });
+  renderChatView();
+  await waitFor(() => expect(screen.queryByText("Loading…")).not.toBeInTheDocument());
+  const send = (text: string) => {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  };
+  send("first");
+  act(() => event("llm_done", {}));
+  send("second");
+  send("third");
+  expect(api.chat).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("Queue message")).toBeInTheDocument();
+  await act(async () => finishes[0]());
+  expect(api.chat.mock.calls[1][1]).toBe("second");
+  await act(async () => finishes[1]());
+  expect(api.chat.mock.calls[2][1]).toBe("third");
+  await act(async () => finishes[2]());
+  expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
+});
+
+it("waits for interruption and stream completion before prioritizing new context", async () => {
+  sessionStorage.clear();
+  vi.clearAllMocks();
+  api.listMessages.mockResolvedValue(mockMessageList);
+  let finish!: () => void;
+  let acknowledge!: () => void;
+  api.chat.mockReturnValueOnce(new Promise<void>(resolve => { finish = resolve; })).mockResolvedValue(undefined);
+  api.interruptChat.mockReturnValue(new Promise(resolve => { acknowledge = () => resolve({ interrupted: true }); }));
+  renderChatView();
+  await waitFor(() => expect(screen.queryByText("Loading…")).not.toBeInTheDocument());
+  const input = screen.getByRole("textbox");
+  fireEvent.change(input, { target: { value: "first" } });
+  fireEvent.click(screen.getByText("Send"));
+  fireEvent.change(input, { target: { value: "queued" } });
+  fireEvent.click(screen.getByText("Queue message"));
+  fireEvent.change(input, { target: { value: "new context" } });
+  fireEvent.click(screen.getByText("Interrupt and send"));
+  expect(api.interruptChat).toHaveBeenCalledWith("abc123");
+  await act(async () => acknowledge());
+  expect(api.chat).toHaveBeenCalledTimes(1);
+  await act(async () => finish());
+  expect(api.chat.mock.calls.map(call => call[1])).toEqual(["first", "new context", "queued"]);
+});
+
+it("keeps the draft when interruption fails", async () => {
+  sessionStorage.clear();
+  vi.clearAllMocks();
+  api.listMessages.mockResolvedValue(mockMessageList);
+  api.chat.mockReturnValue(new Promise(() => {}));
+  api.interruptChat.mockRejectedValue(new Error("offline"));
+  renderChatView();
+  await waitFor(() => expect(screen.queryByText("Loading…")).not.toBeInTheDocument());
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
+  fireEvent.click(screen.getByText("Send"));
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "keep this" } });
+  fireEvent.click(screen.getByText("Interrupt and send"));
+  await screen.findByText("Could not interrupt agent: offline");
+  expect(screen.getByRole("textbox")).toHaveValue("keep this");
+  expect(api.chat).toHaveBeenCalledTimes(1);
+});
+
+it("restores pending follow-ups for the same session without sending automatically", async () => {
+  vi.clearAllMocks();
+  sessionStorage.setItem("chat-queue:abc123", JSON.stringify(["saved follow-up"]));
+  api.listMessages.mockResolvedValue(mockMessageList);
+  api.chat.mockResolvedValue(undefined);
+  renderChatView();
+  await screen.findByText("saved follow-up");
+  await waitFor(() => expect(screen.getByText("Resume queued messages")).toBeEnabled());
+  expect(api.chat).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByText("Resume queued messages"));
+  await waitFor(() => expect(api.chat).toHaveBeenCalledWith("abc123", "saved follow-up", undefined, expect.any(Function), expect.any(AbortSignal)));
+  expect(sessionStorage.getItem("chat-queue:abc123")).toBeNull();
 });
